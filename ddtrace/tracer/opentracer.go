@@ -14,6 +14,13 @@ func NewOpenTracer(opts ...StartOption) opentracing.Tracer {
 	return &opentracer{internal.GetGlobalTracer()}
 }
 
+// NewCustomOpenTracer creates, instantiates and returns an Opentracing compatible version of the
+// Datadog tracer using the provided set of options and a custom Datadog tracer.
+func NewCustomOpenTracer(t ddtrace.Tracer, opts ...StartOption) opentracing.Tracer {
+	Start(opts...)
+	return &opentracer{t}
+}
+
 var _ opentracing.Tracer = (*opentracer)(nil)
 
 // opentracer implements opentracing.Tracer on top of ddtrace.Tracer.
