@@ -1,3 +1,8 @@
+// Unless explicitly stated otherwise all files in this repository are licensed
+// under the Apache License Version 2.0.
+// This product includes software developed at Datadog (https://www.datadoghq.com/).
+// Copyright 2016-2019 Datadog, Inc.
+
 package grpc
 
 import (
@@ -7,9 +12,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/require"
+
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/ext"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/mocktracer"
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace/tracer"
+	"gopkg.in/DataDog/dd-trace-go.v1/internal/globalconfig"
 
 	"github.com/stretchr/testify/assert"
 	context "golang.org/x/net/context"
@@ -88,10 +96,12 @@ func TestUnary(t *testing.T) {
 			assert.Equal(clientSpan.Tag(ext.TargetPort), rig.port)
 			assert.Equal(clientSpan.Tag(tagCode), tt.wantCode.String())
 			assert.Equal(clientSpan.TraceID(), rootSpan.TraceID())
+			assert.Equal(clientSpan.Tag(tagMethodKind), methodKindUnary)
 			assert.Equal(serverSpan.Tag(ext.ServiceName), "grpc")
 			assert.Equal(serverSpan.Tag(ext.ResourceName), "/grpc.Fixture/Ping")
 			assert.Equal(serverSpan.Tag(tagCode), tt.wantCode.String())
 			assert.Equal(serverSpan.TraceID(), rootSpan.TraceID())
+			assert.Equal(serverSpan.Tag(tagMethodKind), methodKindUnary)
 		})
 	}
 }
@@ -115,7 +125,7 @@ func TestStreaming(t *testing.T) {
 		stream.Recv()
 	}
 
-	checkSpans := func(t *testing.T, rig *rig, spans []mocktracer.Span, unknownSpan mocktracer.Span) {
+	checkSpans := func(t *testing.T, rig *rig, spans []mocktracer.Span) {
 		var rootSpan mocktracer.Span
 		for _, span := range spans {
 			if span.OperationName() == "a" {
@@ -123,7 +133,6 @@ func TestStreaming(t *testing.T) {
 			}
 		}
 		assert.NotNil(t, rootSpan)
-
 		for _, span := range spans {
 			if span != rootSpan {
 				assert.Equal(t, rootSpan.TraceID(), span.TraceID(),
@@ -144,16 +153,23 @@ func TestStreaming(t *testing.T) {
 				assert.Equal(t, rig.port, span.Tag(ext.TargetPort),
 					"expected target host port to be set in span: %v", span)
 				fallthrough
-			case "grpc.server", "grpc.message":
+			case "grpc.server":
+				assert.Equal(t, methodKindBidiStream, span.Tag(tagMethodKind),
+					"expected tag %s == %s, but found %s.",
+					tagMethodKind, methodKindBidiStream, span.Tag(tagMethodKind))
+				fallthrough
+			case "grpc.message":
 				wantCode := codes.OK
-				if span == unknownSpan {
-					wantCode = codes.Unknown
+				if errTag := span.Tag("error"); errTag != nil {
+					if err, ok := errTag.(error); ok {
+						wantCode = status.Convert(err).Code()
+					}
 				}
 				assert.Equal(t, wantCode.String(), span.Tag(tagCode),
 					"expected grpc code to be set in span: %v", span)
 				assert.Equal(t, "/grpc.Fixture/StreamPing", span.Tag(ext.ResourceName),
 					"expected resource name to be set in span: %v", span)
-				assert.Equal(t, "/grpc.Fixture/StreamPing", span.Tag(tagMethod),
+				assert.Equal(t, "/grpc.Fixture/StreamPing", span.Tag(tagMethodName),
 					"expected grpc method name to be set in span: %v", span)
 			}
 		}
@@ -183,7 +199,7 @@ func TestStreaming(t *testing.T) {
 		assert.Len(t, spans, 13,
 			"expected 4 client messages + 4 server messages + 1 server call + 1 client call + 1 error from empty recv + 1 parent ctx, but got %v",
 			len(spans))
-		checkSpans(t, rig, spans, spans[len(spans)-1])
+		checkSpans(t, rig, spans)
 	})
 
 	t.Run("CallsOnly", func(t *testing.T) {
@@ -210,7 +226,7 @@ func TestStreaming(t *testing.T) {
 		assert.Len(t, spans, 3,
 			"expected 1 server call + 1 client call + 1 parent ctx, but got %v",
 			len(spans))
-		checkSpans(t, rig, spans, spans[len(spans)-1])
+		checkSpans(t, rig, spans)
 	})
 
 	t.Run("MessagesOnly", func(t *testing.T) {
@@ -237,7 +253,7 @@ func TestStreaming(t *testing.T) {
 		assert.Len(t, spans, 11,
 			"expected 4 client messages + 4 server messages + 1 error from empty recv + 1 parent ctx, but got %v",
 			len(spans))
-		checkSpans(t, rig, spans, nil)
+		checkSpans(t, rig, spans)
 	})
 }
 
@@ -335,6 +351,50 @@ func TestPreservesMetadata(t *testing.T) {
 		"existing metadata should be preserved")
 }
 
+func TestStreamSendsErrorCode(t *testing.T) {
+	wantCode := codes.InvalidArgument.String()
+
+	mt := mocktracer.Start()
+	defer mt.Stop()
+
+	rig, err := newRig(true)
+	require.NoError(t, err, "error setting up rig")
+	defer rig.Close()
+
+	ctx := context.Background()
+
+	stream, err := rig.client.StreamPing(ctx)
+	require.NoError(t, err, "no error should be returned after creating stream client")
+
+	err = stream.Send(&FixtureRequest{Name: "invalid"})
+	require.NoError(t, err, "no error should be returned after sending message")
+
+	resp, err := stream.Recv()
+	assert.Error(t, err, "should return error")
+	assert.Nil(t, resp, "received message should be nil because of error")
+
+	err = stream.CloseSend()
+	require.NoError(t, err, "should not return error after closing stream")
+
+	// to flush the spans
+	_, _ = stream.Recv()
+
+	containsErrorCode := false
+	spans := mt.FinishedSpans()
+
+	// check if at least one span has error code
+	for _, s := range spans {
+		if s.Tag(tagCode) == wantCode {
+			containsErrorCode = true
+		}
+	}
+	assert.True(t, containsErrorCode, "at least one span should contain error code")
+
+	// ensure that last span contains error code also
+	gotLastSpanCode := spans[len(spans)-1].Tag(tagCode)
+	assert.Equal(t, gotLastSpanCode, wantCode, "last span should contain error code")
+}
+
 // fixtureServer a dummy implemenation of our grpc fixtureServer.
 type fixtureServer struct {
 	lastRequestMetadata atomic.Value
@@ -399,7 +459,7 @@ func (r *rig) Close() {
 	r.listener.Close()
 }
 
-func newRig(traceClient bool, interceptorOpts ...InterceptorOption) (*rig, error) {
+func newRig(traceClient bool, interceptorOpts ...Option) (*rig, error) {
 	interceptorOpts = append([]InterceptorOption{WithServiceName("grpc")}, interceptorOpts...)
 
 	server := grpc.NewServer(
@@ -453,4 +513,81 @@ func waitForSpans(mt mocktracer.Tracer, sz int, maxWait time.Duration) {
 		}
 		time.Sleep(time.Millisecond * 100)
 	}
+}
+
+func TestAnalyticsSettings(t *testing.T) {
+	assertRate := func(t *testing.T, mt mocktracer.Tracer, rate interface{}, opts ...InterceptorOption) {
+		rig, err := newRig(true, opts...)
+		if err != nil {
+			t.Fatalf("error setting up rig: %s", err)
+		}
+		defer rig.Close()
+
+		client := rig.client
+		resp, err := client.Ping(context.Background(), &FixtureRequest{Name: "pass"})
+		assert.Nil(t, err)
+		assert.Equal(t, resp.Message, "passed")
+
+		spans := mt.FinishedSpans()
+		assert.Len(t, spans, 2)
+
+		var serverSpan, clientSpan mocktracer.Span
+
+		for _, s := range spans {
+			// order of traces in buffer is not garanteed
+			switch s.OperationName() {
+			case "grpc.server":
+				serverSpan = s
+			case "grpc.client":
+				clientSpan = s
+			}
+		}
+
+		assert.Equal(t, rate, clientSpan.Tag(ext.EventSampleRate))
+		assert.Equal(t, rate, serverSpan.Tag(ext.EventSampleRate))
+	}
+
+	t.Run("defaults", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		assertRate(t, mt, nil)
+	})
+
+	t.Run("global", func(t *testing.T) {
+		t.Skip("global flag disabled")
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		rate := globalconfig.AnalyticsRate()
+		defer globalconfig.SetAnalyticsRate(rate)
+		globalconfig.SetAnalyticsRate(0.4)
+
+		assertRate(t, mt, 0.4)
+	})
+
+	t.Run("enabled", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		assertRate(t, mt, 1.0, WithAnalytics(true))
+	})
+
+	t.Run("disabled", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		assertRate(t, mt, nil, WithAnalytics(false))
+	})
+
+	t.Run("override", func(t *testing.T) {
+		mt := mocktracer.Start()
+		defer mt.Stop()
+
+		rate := globalconfig.AnalyticsRate()
+		defer globalconfig.SetAnalyticsRate(rate)
+		globalconfig.SetAnalyticsRate(0.4)
+
+		assertRate(t, mt, 0.23, WithAnalyticsRate(0.23))
+	})
 }
